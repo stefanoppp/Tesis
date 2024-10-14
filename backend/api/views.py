@@ -6,6 +6,13 @@ from rest_framework.views import APIView
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 from django.core.files.storage import FileSystemStorage
+from .core import ModelProcessor
+from .models import ModeloEntrenado
+from rest_framework.authtoken.models import Token
+import os
+import pickle
+import pandas as pd
+from pycaret.classification import predict_model
 # Registro
 class RegisterView(APIView):
     permission_classes = [AllowAny]
@@ -38,35 +45,88 @@ class LoginView(APIView):
             }, status=status.HTTP_200_OK)
         return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
 
-# Vistas protegidas
-class MainPageView(APIView):
+# Vistas protegidas-------------------------------
+class UploadFileView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
-        return Response({"message": f"Ingresado exitosamente! Usuario, {request.user.username}!"}, status=status.HTTP_200_OK)
-
-class UploadFileView(APIView):
-    permission_classes = [IsAuthenticated] 
     def post(self, request):
         # Obtén el archivo y los parámetros numéricos
         file = request.FILES.get('file')
-        param1 = request.data.get('param1')
-        param2 = request.data.get('param2')
+        target = request.data.get('target')
+        outliers = request.data.get('outliers')
+        processing = request.data.get('processing')
 
         # Verifica si el archivo y los parámetros están presentes
         if not file:
-            return Response({'error': 'No file provided.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'No se ha enviado archivo.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if param1 is None or param2 is None:
-            return Response({'error': 'Both param1 and param2 must be provided.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Aquí puedes agregar validaciones para los parámetros numéricos si es necesario
+        if target is None:
+            return Response({'error': 'Target debe ser indicado.'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Guarda el archivo (puedes usar almacenamiento en S3)
         fs = FileSystemStorage()
         filename = fs.save(file.name, file)
-        
-        # Llama a tu proceso de IA aquí, pasando los parámetros
-        # process_data(filename, param1, param2)
+        filename_sin_extension = os.path.splitext(filename)[0]
 
-        return Response({'message': 'File uploaded successfully', 'filename': filename, 'param1': param1, 'param2': param2}, status=status.HTTP_201_CREATED)
+        model = ModelProcessor(processing, target, outliers, filename_sin_extension)
+        modelo_entrenado = model.process()
+
+        # Serializa el modelo entrenado
+        modelo_entrenado_serializado = pickle.dumps(modelo_entrenado)
+
+        modelo_entrenado_db = ModeloEntrenado.objects.create(
+            modelo=modelo_entrenado_serializado,
+            usuario=request.user
+        )
+
+        token = Token.objects.get_or_create(user=request.user)
+
+        return Response({'token': token[0].key, 'modelo_id': modelo_entrenado_db.id}, status=status.HTTP_201_CREATED)
+
+class PredictView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        token = request.data.get('token')
+        modelo_id = request.data.get('modelo_id')
+        params = request.data.get('params')
+
+        # Verificar token y obtener modelo
+        if not self._validar_token(token):
+            return Response({'error': 'Token inválido'}, status=401)
+
+        modelo = self._obtener_modelo(modelo_id)
+        if not modelo:
+            return Response({'error': 'Modelo no encontrado o inválido'}, status=404)
+
+        # Validar parámetros de entrada
+        if not self._validar_parametros(modelo, params):
+            return Response({'error': 'Parámetros inválidos o incompletos'}, status=400)
+
+        # Hacer predicción
+        try:
+            data_nueva = pd.DataFrame([params])
+            predicciones = modelo.predict(data_nueva)
+            return Response({'predicción': predicciones.tolist()}, status=200)
+        except Exception as e:
+            return Response({'error': f'Error al hacer la predicción: {str(e)}'}, status=500)
+
+    def _validar_token(self, token):
+        """Valida si el token existe."""
+        return Token.objects.filter(key=token).exists()
+
+    def _obtener_modelo(self, modelo_id):
+        """Obtiene y deserializa el modelo entrenado."""
+        try:
+            modelo_entrenado = ModeloEntrenado.objects.get(id=modelo_id)
+            return pickle.loads(modelo_entrenado.modelo)
+        except (ModeloEntrenado.DoesNotExist, pickle.UnpicklingError):
+            return None
+
+    def _validar_parametros(self, modelo, params):
+        """Verifica que los parámetros coincidan con los esperados por el modelo."""
+        try:
+            features_esperados = modelo.feature_names_in_
+            return all(key in params for key in features_esperados)
+        except AttributeError:
+            return False
