@@ -50,10 +50,10 @@ class UploadFileView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        # Obtén el archivo y los parámetros numéricos
+        
         file = request.FILES.get('file')
         target = request.data.get('target')
-        outliers = request.data.get('outliers')
+        ignore = request.data.get('ignore')
         processing = request.data.get('processing')
 
         # Verifica si el archivo y los parámetros están presentes
@@ -63,12 +63,14 @@ class UploadFileView(APIView):
         if target is None:
             return Response({'error': 'Target debe ser indicado.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        if processing not in ["time-series", "classification", "regression"]:
+            return Response({'error': 'Procesamiento no valido.'}, status=status.HTTP_400_BAD_REQUEST)
         # Guarda el archivo (puedes usar almacenamiento en S3)
         fs = FileSystemStorage()
         filename = fs.save(file.name, file)
         filename_sin_extension = os.path.splitext(filename)[0]
 
-        model = ModelProcessor(processing, target, outliers, filename_sin_extension)
+        model = ModelProcessor(processing, target, ignore, filename_sin_extension)
         modelo_entrenado = model.process()
 
         # Serializa el modelo entrenado
@@ -79,21 +81,15 @@ class UploadFileView(APIView):
             usuario=request.user
         )
 
-        token = Token.objects.get_or_create(user=request.user)
+        return Response({'modelo_id': modelo_entrenado_db.id}, status=status.HTTP_201_CREATED)
 
-        return Response({'token': token[0].key, 'modelo_id': modelo_entrenado_db.id}, status=status.HTTP_201_CREATED)
 
 class PredictView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        token = request.data.get('token')
         modelo_id = request.data.get('modelo_id')
         params = request.data.get('params')
-
-        # Verificar token y obtener modelo
-        if not self._validar_token(token):
-            return Response({'error': 'Token inválido'}, status=401)
 
         modelo = self._obtener_modelo(modelo_id)
         if not modelo:
@@ -111,10 +107,6 @@ class PredictView(APIView):
         except Exception as e:
             return Response({'error': f'Error al hacer la predicción: {str(e)}'}, status=500)
 
-    def _validar_token(self, token):
-        """Valida si el token existe."""
-        return Token.objects.filter(key=token).exists()
-
     def _obtener_modelo(self, modelo_id):
         """Obtiene y deserializa el modelo entrenado."""
         try:
@@ -127,6 +119,7 @@ class PredictView(APIView):
         """Verifica que los parámetros coincidan con los esperados por el modelo."""
         try:
             features_esperados = modelo.feature_names_in_
+            print("Parámetros esperados por el modelo:", features_esperados)
             return all(key in params for key in features_esperados)
         except AttributeError:
             return False
